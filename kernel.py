@@ -1,12 +1,16 @@
-
+#!/usr/bin/env python
 # coding: utf-8
 
-# In[ ]:
+# In[1]:
 
 
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = "0"
 import time
+import sys
 import random
 import pandas as pd
+import re
 import numpy as np
 import gc
 import re
@@ -30,7 +34,7 @@ from torch.autograd import Variable
 from torchtext.data import Example
 from sklearn.metrics import f1_score
 import torchtext
-import os 
+
 
 from keras.preprocessing.text import Tokenizer
 from keras.preprocessing.sequence import pad_sequences
@@ -41,7 +45,7 @@ from sklearn.metrics import f1_score
 from torch.optim.optimizer import Optimizer
 from unidecode import unidecode
 
-
+import spacy
 # In[ ]:
 
 
@@ -56,6 +60,80 @@ SEED = 1029
 
 
 # In[ ]:
+
+
+# In[2]:
+
+
+class Tokenizor():
+    def __init__(self, lang='en'):
+        self.re_br = re.compile(r'<\s*br\s*/?>', re.IGNORECASE)
+        self.tok = spacy.load(lang)
+        for w in ('<eos>','<bos>','<unk>'):
+            self.tok.tokenizer.add_special_case(w, [{ORTH: w}])
+
+    def sub_br(self,x): return self.re_br.sub("\n", x)
+
+    def spacy_tok(self,x):
+        return [t.text for t in self.tok.tokenizer(self.sub_br(x))]
+
+    re_rep = re.compile(r'(\S)(\1{3,})')
+    re_word_rep = re.compile(r'(\b\w+\W+)(\1{3,})')
+
+    @staticmethod
+    def replace_rep(m):
+        TK_REP = 'tk_rep'
+        c,cc = m.groups()
+        return f' {TK_REP} {len(cc)+1} {c} '
+
+    @staticmethod
+    def replace_wrep(m):
+        TK_WREP = 'tk_wrep'
+        c,cc = m.groups()
+        return f' {TK_WREP} {len(cc.split())+1} {c} '
+
+    @staticmethod
+    def do_caps(ss):
+        TOK_UP,TOK_SENT,TOK_MIX = ' t_up ',' t_st ',' t_mx '
+        res = []
+        prev='.'
+        re_word = re.compile('\w')
+        re_nonsp = re.compile('\S')
+        for s in re.findall(r'\w+|\W+', ss):
+            res += ([TOK_UP,s.lower()] if (s.isupper() and (len(s)>2))
+    #                 else [TOK_SENT,s.lower()] if (s.istitle() and re_word.search(prev))
+                    else [s.lower()])
+    #         if re_nonsp.search(s): prev = s
+        return ''.join(res)
+
+    def proc_text(self, s):
+        s = self.re_rep.sub(Tokenizor.replace_rep, s)
+        s = self.re_word_rep.sub(Tokenizor.replace_wrep, s)
+        s = Tokenizor.do_caps(s)
+        s = re.sub(r'([/#])', r' \1 ', s)
+        s = re.sub(' {2,}', ' ', s)
+        return self.spacy_tok(s)
+
+    @staticmethod
+    def proc_all(ss, lang):
+        tok = Tokenizor(lang)
+        return [tok.proc_text(s) for s in ss]
+
+    @staticmethod
+    def proc_all_mp(ss, lang='en', ncpus = None):
+        ncpus = ncpus or num_cpus()//2
+        with ProcessPoolExecutor(ncpus) as e:
+            return sum(e.map(Tokenizor.proc_all, ss, [lang]*len(ss)), [])
+        
+def partition_by_cores(a):
+    return partition(a, len(a)//num_cpus() + 1)
+
+def partition(a, sz): 
+    """splits iterables a in equal parts of size sz"""
+    return [a[i:i+sz] for i in range(0, len(a), sz)]
+
+
+# In[3]:
 
 
 def seed_everything(seed=1029):
@@ -152,7 +230,20 @@ def build_vocab(texts):
             except KeyError:
                 vocab[word] = 1
     return vocab
+
+ORTH = 65
+def num_cpus():
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return os.cpu_count()
+    
+from concurrent.futures import ProcessPoolExecutor
+
 vocab = build_vocab(df['question_text'])
+
+
+# In[4]:
 
 
 # In[ ]:
@@ -169,17 +260,6 @@ print("# Test samples: {:,}({:.3f}% of train samples)".format(len(df_test),len(d
 
 # In[ ]:
 
-
-def build_vocab(texts):
-    sentences = texts.apply(lambda x: x.split()).values
-    vocab = {}
-    for sentence in sentences:
-        for word in sentence:
-            try:
-                vocab[word] += 1
-            except KeyError:
-                vocab[word] = 1
-    return vocab
 
 def known_contractions(embed):
     known = []
@@ -293,15 +373,11 @@ def load_and_prec():
     print("Train shape : ",train_df.shape)
     print("Test shape : ",test_df.shape)
     
-    # lower
-    train_df["question_text"] = train_df["question_text"].apply(lambda x: x.lower())
-    test_df["question_text"] = test_df["question_text"].apply(lambda x: x.lower())
-
     # Clean the text
     train_df["question_text"] = train_df["question_text"].progress_apply(lambda x: clean_text(x))
     test_df["question_text"] = test_df["question_text"].apply(lambda x: clean_text(x))
     
-    # Clean numbers
+    # clean numbers
     train_df["question_text"] = train_df["question_text"].progress_apply(lambda x: clean_numbers(x))
     test_df["question_text"] = test_df["question_text"].apply(lambda x: clean_numbers(x))
     
@@ -315,37 +391,20 @@ def load_and_prec():
 
 
     
-    ###################### Add Features ###############################
-    #  https://github.com/wongchunghang/toxic-comment-challenge-lstm/blob/master/toxic_comment_9872_model.ipynb
-    train = add_features(train_df)
-    test = add_features(test_df)
-
-    features = train[['caps_vs_length', 'words_vs_unique']].fillna(0)
-    test_features = test[['caps_vs_length', 'words_vs_unique']].fillna(0)
-
-    ss = StandardScaler()
-    ss.fit(np.vstack((features, test_features)))
-    features = ss.transform(features)
-    test_features = ss.transform(test_features)
-    ###########################################################################
-
     ## Tokenize the sentences
+    train_X = Tokenizor().proc_all_mp(partition_by_cores(train_X))
+    test_X = Tokenizor().proc_all_mp(partition_by_cores(test_X))
+    
     tokenizer = Tokenizer(num_words=max_features)
     tokenizer.fit_on_texts(list(train_X))
     train_X = tokenizer.texts_to_sequences(train_X)
     test_X = tokenizer.texts_to_sequences(test_X)
 
-    ## Pad the sentences 
     train_X = pad_sequences(train_X, maxlen=maxlen)
     test_X = pad_sequences(test_X, maxlen=maxlen)
 
     ## Get the target values
-    train_y = train_df['target'].values
-    
-#     # Splitting to training and a final test set    
-#     train_X, x_test_f, train_y, y_test_f = train_test_split(list(zip(train_X,features)), train_y, test_size=0.2, random_state=SEED)    
-#     train_X, features = zip(*train_X)
-#     x_test_f, features_t = zip(*x_test_f)    
+    train_y = train_df['target'].values 
     
     #shuffling the data
     np.random.seed(SEED)
@@ -353,48 +412,41 @@ def load_and_prec():
 
     train_X = train_X[trn_idx]
     train_y = train_y[trn_idx]
-    
-    return train_X, test_X, train_y, features, test_features, tokenizer.word_index
-#     return train_X, test_X, train_y, x_test_f,y_test_f,features, test_features, features_t, tokenizer.word_index
-#     return train_X, test_X, train_y, tokenizer.word_index
 
+    return train_X, test_X, train_y, tokenizer.word_index
 
-# In[ ]:
-
-
-# fill up the missing values
-# x_train, x_test, y_train, word_index = load_and_prec()
-x_train, x_test, y_train, features, test_features, word_index = load_and_prec() 
-# x_train, x_test, y_train, x_test_f,y_test_f,features, test_features,features_t, word_index = load_and_prec() 
 
 
 # In[ ]:
+
+
+# In[6]:
+
+
+x_train, x_test, y_train, word_index = load_and_prec() 
+
+
+# In[7]:
 
 
 np.save("x_train",x_train)
 np.save("x_test",x_test)
 np.save("y_train",y_train)
-
-np.save("features",features)
-np.save("test_features",test_features)
 np.save("word_index.npy",word_index)
 
 
-# In[ ]:
+# In[8]:
 
 
 x_train = np.load("x_train.npy")
 x_test = np.load("x_test.npy")
 y_train = np.load("y_train.npy")
-features = np.load("features.npy")
-test_features = np.load("test_features.npy")
 word_index = np.load("word_index.npy").item()
 
 
-# In[ ]:
+# In[9]:
 
 
-# missing entries in the embedding are set using np.random.normal so we have to seed here too
 seed_everything()
 
 glove_embeddings = load_glove(word_index)
@@ -415,10 +467,9 @@ splits = list(StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=SEED
 splits[:3]
 
 
-# In[ ]:
+# In[10]:
 
 
-# code inspired from: https://github.com/anandsaha/pytorch.cyclic.learning.rate/blob/master/cls.py
 class CyclicLR(object):
     def __init__(self, optimizer, base_lr=1e-3, max_lr=6e-3,
                  step_size=2000, mode='triangular', gamma=1.,
@@ -703,18 +754,15 @@ class NeuralNet(nn.Module):
         self.lstm = nn.LSTM(embed_size, hidden_size, bidirectional=True, batch_first=True)
         self.gru = nn.GRU(hidden_size * 2, hidden_size, bidirectional=True, batch_first=True)
 
-        self.lstm2 = nn.LSTM(hidden_size * 2, hidden_size, bidirectional=True, batch_first=True)
-
         self.lstm_attention = Attention(hidden_size * 2, maxlen)
         self.gru_attention = Attention(hidden_size * 2, maxlen)
         
-        self.linear = nn.Linear(hidden_size*8+3, fc_layer1) #643:80 - 483:60 - 323:40
+        self.linear = nn.Linear(hidden_size*8+1, fc_layer1) #643:80 - 483:60 - 323:40
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(0.1)
-        self.fc = nn.Linear(fc_layer**2,fc_layer)
-        self.out = nn.Linear(fc_layer, 1)
         self.lincaps = nn.Linear(Num_capsule * Dim_capsule, 1)
         self.caps_layer = Caps_Layer()
+        self.out = nn.Linear(fc_layer, 1)
     
     def forward(self, x):
         
@@ -742,18 +790,15 @@ class NeuralNet(nn.Module):
         avg_pool = torch.mean(h_gru, 1)
         # global max pooling
         max_pool, _ = torch.max(h_gru, 1)
-        
-        f = torch.tensor(x[1], dtype=torch.float).cuda()
 
                 #[512,160]
-        conc = torch.cat((h_lstm_atten, h_gru_atten,content3, avg_pool, max_pool,f), 1)
+        conc = torch.cat((h_lstm_atten, h_gru_atten,content3, avg_pool, max_pool), 1)
         conc = self.relu(self.linear(conc))
         conc = self.dropout(conc)
 
         out = self.out(conc)
         
         return out
-
 
 # In[ ]:
 
@@ -785,7 +830,7 @@ avg_losses_f = []
 avg_val_losses_f = []
 
 
-# In[ ]:
+# In[11]:
 
 
 for i, (train_idx, valid_idx) in enumerate(splits):    
@@ -793,13 +838,11 @@ for i, (train_idx, valid_idx) in enumerate(splits):
     # also, convert them to a torch tensor and store them on the GPU (done with .cuda())
     x_train = np.array(x_train)
     y_train = np.array(y_train)
-    features = np.array(features)
 
     x_train_fold = torch.tensor(x_train[train_idx.astype(int)], dtype=torch.long).cuda()
     y_train_fold = torch.tensor(y_train[train_idx.astype(int), np.newaxis], dtype=torch.float32).cuda()
+
     
-    kfold_X_features = features[train_idx.astype(int)]
-    kfold_X_valid_features = features[valid_idx.astype(int)]
     x_val_fold = torch.tensor(x_train[valid_idx.astype(int)], dtype=torch.long).cuda()
     y_val_fold = torch.tensor(y_train[valid_idx.astype(int), np.newaxis], dtype=torch.float32).cuda()
     
@@ -842,8 +885,7 @@ for i, (train_idx, valid_idx) in enumerate(splits):
         for i, (x_batch, y_batch) in enumerate(train_loader):
             # Forward pass: compute predicted y by passing x to the model.
             ################################################################################################            
-            f = kfold_X_features[i * batch_size:(i+1) * batch_size]
-            y_pred = model([x_batch,f])
+            y_pred = model([x_batch])
             ################################################################################################
 
             ################################################################################################
@@ -876,9 +918,8 @@ for i, (train_idx, valid_idx) in enumerate(splits):
         test_preds_fold = np.zeros((len(df_test)))
         
         avg_val_loss = 0.
-        for i, (x_batch, y_batch) in enumerate(valid_loader):
-            f = kfold_X_valid_features[i * batch_size:(i+1) * batch_size]            
-            y_pred = model([x_batch,f]).detach()
+        for i, (x_batch, y_batch) in enumerate(valid_loader): 
+            y_pred = model([x_batch]).detach()
             
             avg_val_loss += loss_fn(y_pred, y_batch).item() / len(valid_loader)
             valid_preds_fold[i * batch_size:(i+1) * batch_size] = sigmoid(y_pred.cpu().numpy())[:, 0]
@@ -890,20 +931,18 @@ for i, (train_idx, valid_idx) in enumerate(splits):
     avg_val_losses_f.append(avg_val_loss) 
     # predict all samples in the test set batch per batch
     for i, (x_batch,) in enumerate(test_loader):
-        f = test_features[i * batch_size:(i+1) * batch_size]
-        y_pred = model([x_batch,f]).detach()
+        y_pred = model([x_batch]).detach()
 
         test_preds_fold[i * batch_size:(i+1) * batch_size] = sigmoid(y_pred.cpu().numpy())[:, 0]
         
     train_preds[valid_idx] = valid_preds_fold
-    test_preds += test_preds_fold / len(splits)
+    test_preds += test_preds_fold
+    break
 
 print('All \t loss={:.4f} \t val_loss={:.4f} \t '.format(np.average(avg_losses_f),np.average(avg_val_losses_f)))
 
-# x_train, x_test_f, y_train, y_test_f
 
-
-# In[ ]:
+# In[12]:
 
 
 def bestThresshold(y_train,train_preds):
@@ -925,4 +964,10 @@ delta = bestThresshold(y_train,train_preds)
 submission = df_test[['qid']].copy()
 submission['prediction'] = (test_preds > delta).astype(int)
 submission.to_csv('submission.csv', index=False)
+
+
+# In[ ]:
+
+
+
 
